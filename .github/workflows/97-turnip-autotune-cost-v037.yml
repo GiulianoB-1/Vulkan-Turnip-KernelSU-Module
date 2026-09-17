@@ -1,0 +1,154 @@
+name: 97 - Turnip Autotune Cost Diagnostic v0.37
+
+on:
+  push:
+    branches:
+      - diagnostic/autotune-cost-v037
+    paths:
+      - .github/workflows/97-turnip-autotune-cost-v037.yml
+      - scripts/92_*
+      - scripts/96_*
+      - scripts/97_*
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  NDK_VERSION: 30.0.16248370
+  GLSLANG_COMMIT: e1b562a8bed273a02f30b59b66a5d499793cede5
+  CCACHE_DIR: ${{ github.workspace }}/.ccache-turnip
+  CCACHE_MAXSIZE: 4G
+
+jobs:
+  build:
+    name: Build v0.37 bandwidth-cost diagnostic
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Check out project
+        uses: actions/checkout@v4
+
+      - name: Install host dependencies
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            curl xz-utils zip unzip file binutils patchelf ccache pkg-config cmake \
+            python3 python3-pip python3-setuptools python3-wheel \
+            flex bison git ca-certificates
+          python3 -m pip install --user --upgrade "meson>=1.4" ninja mako pyyaml packaging
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Restore compiler cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: turnip-mesa2622-v037-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            turnip-mesa2622-v037-${{ runner.os }}-
+            turnip-mesa2622-v036-${{ runner.os }}-
+            a52-turnip-mesa2622-v036-ccache-${{ runner.os }}-
+            a52-turnip-mesa2622-ccache-${{ runner.os }}-
+
+      - name: Build pinned glslang
+        run: |
+          set -Eeuo pipefail
+          SRC="$RUNNER_TEMP/glslang-src"
+          BUILD="$RUNNER_TEMP/glslang-build"
+          DEST="$HOME/.local/bin"
+          rm -rf "$SRC" "$BUILD"
+          git clone --filter=blob:none https://github.com/KhronosGroup/glslang.git "$SRC"
+          git -C "$SRC" checkout --detach "$GLSLANG_COMMIT"
+          test "$(git -C "$SRC" rev-parse HEAD)" = "$GLSLANG_COMMIT"
+          cmake -S "$SRC" -B "$BUILD" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_EXTERNAL=OFF -DENABLE_OPT=OFF \
+            -DENABLE_HLSL=OFF -DGLSLANG_TESTS=OFF -DGLSLANG_ENABLE_INSTALL=OFF \
+            -DENABLE_GLSLANG_BINARIES=ON
+          cmake --build "$BUILD" --target glslang-standalone --parallel 2
+          mkdir -p "$DEST"
+          cp -L "$BUILD/StandAlone/glslangValidator" "$DEST/glslangValidator"
+          chmod 0755 "$DEST/glslangValidator"
+          echo "$DEST" >> "$GITHUB_PATH"
+
+      - name: Locate Android SDK and install NDK r30
+        run: |
+          set -Eeuo pipefail
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f -name sdkmanager | sort | tail -1)"
+          test -x "$SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+          "$SDKMANAGER" "ndk;$NDK_VERSION"
+          NDK_ROOT="$SDK_ROOT/ndk/$NDK_VERSION"
+          test -d "$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64"
+          echo "NDK_ROOT=$NDK_ROOT" >> "$GITHUB_ENV"
+
+      - name: Configure compiler cache
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$CCACHE_DIR"
+          ccache --max-size "$CCACHE_MAXSIZE"
+          ccache --set-config=compression=true
+          ccache --set-config=compression_level=6
+          ccache --zero-stats
+
+      - name: Build v0.37 diagnostic Turnip
+        run: |
+          set -o pipefail
+          chmod +x scripts/97_build_turnip_autotune_costdiag_v037.sh
+          mkdir -p artifacts
+          ./scripts/97_build_turnip_autotune_costdiag_v037.sh \
+            "$GITHUB_WORKSPACE" "$NDK_ROOT" \
+            "$GITHUB_WORKSPACE/artifacts/turnip-mesa-26.2.2-v037" \
+            2>&1 | tee artifacts/turnip-v037-build.log
+
+      - name: Package v0.37 diagnostic module
+        run: |
+          set -Eeuo pipefail
+          chmod +x scripts/97_package_turnip_autotune_costdiag_v037.sh
+          ./scripts/97_package_turnip_autotune_costdiag_v037.sh \
+            "$GITHUB_WORKSPACE" \
+            "$GITHUB_WORKSPACE/artifacts/turnip-mesa-26.2.2-v037" \
+            "$GITHUB_WORKSPACE/release-turnip-autotune-v037"
+
+      - name: Audit v0.37 diagnostic build
+        run: |
+          set -Eeuo pipefail
+          DRIVER="$GITHUB_WORKSPACE/artifacts/turnip-mesa-26.2.2-v037/dist/vulkan.adreno.so"
+          INFO="$GITHUB_WORKSPACE/artifacts/turnip-mesa-26.2.2-v037/BUILD-INFO.txt"
+          ZIP="$GITHUB_WORKSPACE/release-turnip-autotune-v037/touchGrass-Turnip-A619-Mesa-26.2.2-v0.37-AUTOTUNE-COST-DIAG-KSU.zip"
+          RX="$GITHUB_WORKSPACE/artifacts/turnip-mesa-26.2.2-v037/dist/tg-autotune-rx"
+          test -s "$DRIVER"
+          test -s "$ZIP"
+          test -x "$RX"
+          grep -Fxq 'mesa_version=26.2.2' "$INFO"
+          grep -Fxq 'kgsl_sync_merge=fixed-mixed-ts-syncfd-and-cross-queue-ts' "$INFO"
+          grep -Fxq 'runtime_logging=autotune-udp-loopback-cost-diagnostic' "$INFO"
+          grep -Fxq 'autotune_diagnostics=udp-loopback-bandwidth-cost-model-port39353' "$INFO"
+          unzip -p "$ZIP" module.prop | grep -Fxq 'version=0.37-vk1.4-autotune-costdiag'
+          unzip -p "$ZIP" module.prop | grep -Fxq 'versionCode=50'
+          strings "$DRIVER" | grep -Fq 'TGAT_DEVICE'
+          strings "$DRIVER" | grep -Fq 'TGAT_INIT %s'
+          strings "$DRIVER" | grep -Fq 'TGAT_COST seq='
+          strings "$DRIVER" | grep -Fq 'draw_bps_sum='
+          strings "$DRIVER" | grep -Fq 'sys_pp='
+          strings "$DRIVER" | grep -Fq 'gmem_pp='
+          strings "$RX" | grep -Fq 'TGAT_RX_READY'
+          file "$DRIVER" | grep -Fq 'ARM aarch64'
+          echo 'v037_autotune_cost_diagnostic_audit=PASS'
+
+      - name: Compiler cache stats
+        if: always()
+        run: ccache --show-stats || true
+
+      - name: Upload v0.37 diagnostic artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Turnip-Autotune-COST-DIAG-v0.37
+          path: |
+            release-turnip-autotune-v037/touchGrass-Turnip-A619-Mesa-26.2.2-v0.37-AUTOTUNE-COST-DIAG-KSU.zip
+            artifacts/turnip-v037-build.log
+            artifacts/turnip-mesa-26.2.2-v037/BUILD-INFO.txt
+          if-no-files-found: error
+          retention-days: 14
