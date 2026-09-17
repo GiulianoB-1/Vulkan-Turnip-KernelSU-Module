@@ -1,0 +1,135 @@
+name: Bootstrap Turnip repository migration
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .migration-trigger
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  migrate:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out destination repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Import stable v0.32 and current diagnostic work
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          OLD_REPO="https://github.com/GiulianoB-1/A52-touchGrass-4.19.325-SukiSU.git"
+          OLD32="$RUNNER_TEMP/turnip-v032"
+          OLD36="$RUNNER_TEMP/turnip-v036"
+
+          git clone --depth 1 --branch agent/a52-turnip-vulkan14-syncmerge-v032 "$OLD_REPO" "$OLD32"
+          git clone --depth 1 --branch agent/a52-turnip-vulkan14-autotune-udpdiag-v036 "$OLD_REPO" "$OLD36"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          mkdir -p scripts docs
+          find "$OLD32/scripts" -maxdepth 1 -type f -name '92_*' -exec cp -f {} scripts/ \;
+
+          cat > README.md <<'EOF'
+          # Vulkan Turnip KernelSU Module
+
+          Mesa Turnip Vulkan driver work for the Samsung Galaxy A52 5G (`a52xq`, Snapdragon 750G / Adreno 619), packaged as a persistent KernelSU module.
+
+          This repository contains the Android/KGSL compatibility work, YUV import fixes, Vulkan 1.4 enablement, KernelSU packaging, probes, diagnostics, and performance investigations that were previously developed inside the touchGrass kernel repository.
+
+          ## Repository policy
+
+          - `main` is the **v0.32 golden functional baseline**.
+          - Experimental work must live on dedicated branches.
+          - The current bandwidth/autotune investigation lives on `diagnostic/autotune-udp-v036`.
+          - Kernel development remains in `GiulianoB-1/A52-touchGrass-4.19.325-SukiSU`.
+
+          ## Golden baseline
+
+          v0.32 retains the stable Vulkan 1.4 A619 stack and includes the legacy KGSL zero-timeout fence polling fix, Android YUV/NV21 compatibility work, Camera compatibility, NAP + 40 ms idle policy, and the KGSL mixed timestamp/sync-FD merge fix that resolved the Warframe crash.
+
+          See `docs/BASELINES.md` and `docs/TESTING.md`.
+          EOF
+
+          cat > docs/BASELINES.md <<'EOF'
+          # Baselines
+
+          ## v0.22
+          First stable Vulkan 1.4 baseline with the legacy KGSL zero-timeout fence polling fix.
+
+          ## v0.26
+          Qualcomm/Samsung flexible YUV420 / NV21 mapping fixed.
+
+          ## v0.28
+          Camera compatibility restored for the explicit NV21 path.
+
+          ## v0.29
+          Removed dead legacy-KGSL probes and bring-up success logging.
+
+          ## v0.30
+          Enabled KGSL NAP (`force_no_nap=0`).
+
+          ## v0.31
+          Set KGSL `idle_timer=40` after on-device A/B testing.
+
+          ## v0.32 — GOLDEN FUNCTIONAL BASELINE
+          Adds the Mesa 26.2.2 KGSL sync-object merge fix for mixed timestamp/sync-FD and cross-queue timestamp merges. This is the reference point for new behavior experiments.
+
+          Golden source branch in the old repository: `agent/a52-turnip-vulkan14-syncmerge-v032`.
+          Historical head: `d9b3f4e1c51e9669d7159ec1dcd51a1a4abde062`.
+          EOF
+
+          cat > docs/TESTING.md <<'EOF'
+          # Testing rules
+
+          1. Branch behavior experiments from the v0.32 golden baseline.
+          2. Make one behavioral change at a time.
+          3. Keep diagnostic-only instrumentation separate from rendering-policy changes.
+          4. Compare against stock Qualcomm Vulkan where relevant.
+          5. Do not tune the kernel GPUBW governor, OPP tables, or bus policy to hide a Turnip-side bandwidth problem.
+          6. Keep KGSL NAP enabled and `idle_timer=40` unless a dedicated experiment proves otherwise.
+          7. Preserve the v0.32 KGSL sync-merge and Android YUV fixes.
+          EOF
+
+          cat > docs/BANDWIDTH-INVESTIGATION.md <<'EOF'
+          # Android UI bandwidth investigation
+
+          Controlled Settings scrolling showed Turnip using much higher average memory bandwidth than stock Qualcomm while GPU busy time remained similar. Kernel GPUBW tracing showed that the extra same-IB bus events were driven by changing average-bandwidth votes, not extra IB transitions.
+
+          Forced GMEM reduced memory bandwidth substantially but increased GPU busy/stall cost. Forced SYSMEM closely matched default Turnip behavior. Synthetic RGBA AHardwareBuffers appeared linear/noncompressed on both drivers, so a simple lost-UBWC explanation was not established.
+
+          Current goal: observe actual Turnip GMEM/SYSMEM/autotune decisions for Android UI renderpasses without changing rendering behavior.
+          EOF
+
+          cat > docs/CHANGELOG.md <<'EOF'
+          # Changelog
+
+          This repository starts with the validated v0.32 functional baseline. Earlier development history remains available in the original kernel repository and is summarized in `BASELINES.md`.
+
+          Experimental v0.33+ diagnostics are kept off `main`.
+          EOF
+
+          git add README.md docs scripts
+          git commit -m "Import Turnip v0.32 golden baseline"
+          git push origin main
+
+          git switch -c diagnostic/autotune-udp-v036
+          find "$OLD36/scripts" -maxdepth 1 -type f \( -name '93_*' -o -name '94_*' -o -name '95_*' -o -name '96_*' \) -exec cp -f {} scripts/ \;
+
+          cat >> docs/BANDWIDTH-INVESTIGATION.md <<'EOF'
+
+          ## Current diagnostic branch
+
+          `diagnostic/autotune-udp-v036` carries the v0.33-v0.36 diagnostic progression. v0.36 bypasses the ROM's unreliable userspace log-write path by sending bounded diagnostic packets over UDP loopback to a bundled on-device receiver. It also adds a device-level heartbeat outside `tu_autotune` so Vulkan device creation can be distinguished from autotune construction.
+          EOF
+
+          git add docs scripts
+          git commit -m "Import v0.33-v0.36 autotune diagnostics"
+          git push -u origin diagnostic/autotune-udp-v036
