@@ -1,0 +1,178 @@
+name: Release v0.32 Golden Baseline
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .release-v032-trigger
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  NDK_VERSION: 30.0.16248370
+  GLSLANG_COMMIT: e1b562a8bed273a02f30b59b66a5d499793cede5
+  CCACHE_DIR: ${{ github.workspace }}/.ccache-turnip
+  CCACHE_MAXSIZE: 4G
+
+jobs:
+  release:
+    name: Build and publish v0.32
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install host dependencies
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            curl xz-utils zip unzip file binutils patchelf ccache pkg-config cmake \
+            python3 python3-pip python3-setuptools python3-wheel \
+            flex bison git ca-certificates
+          python3 -m pip install --user --upgrade "meson>=1.4" ninja mako pyyaml packaging
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Restore compiler cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: a52-turnip-v032-release-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            a52-turnip-v032-release-${{ runner.os }}-
+            a52-turnip-26.2.2-ndk30-${{ runner.os }}-
+
+      - name: Build pinned glslang
+        run: |
+          set -Eeuo pipefail
+          SRC="$RUNNER_TEMP/glslang-src"
+          BUILD="$RUNNER_TEMP/glslang-build"
+          DEST="$HOME/.local/bin"
+          rm -rf "$SRC" "$BUILD"
+          git clone --filter=blob:none https://github.com/KhronosGroup/glslang.git "$SRC"
+          git -C "$SRC" checkout --detach "$GLSLANG_COMMIT"
+          test "$(git -C "$SRC" rev-parse HEAD)" = "$GLSLANG_COMMIT"
+          cmake -S "$SRC" -B "$BUILD" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_EXTERNAL=OFF \
+            -DENABLE_OPT=OFF \
+            -DENABLE_HLSL=OFF \
+            -DGLSLANG_TESTS=OFF \
+            -DGLSLANG_ENABLE_INSTALL=OFF \
+            -DENABLE_GLSLANG_BINARIES=ON
+          cmake --build "$BUILD" --target glslang-standalone --parallel 2
+          mkdir -p "$DEST"
+          cp -L "$BUILD/StandAlone/glslangValidator" "$DEST/glslangValidator"
+          chmod 0755 "$DEST/glslangValidator"
+          echo "$DEST" >> "$GITHUB_PATH"
+          "$DEST/glslangValidator" --version
+
+      - name: Locate Android SDK and install NDK r30
+        run: |
+          set -Eeuo pipefail
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f -name sdkmanager | sort | tail -1)"
+          test -x "$SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+          "$SDKMANAGER" "ndk;$NDK_VERSION"
+          NDK_ROOT="$SDK_ROOT/ndk/$NDK_VERSION"
+          test -d "$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64"
+          echo "NDK_ROOT=$NDK_ROOT" >> "$GITHUB_ENV"
+
+      - name: Configure compiler cache
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$CCACHE_DIR"
+          ccache --max-size "$CCACHE_MAXSIZE"
+          ccache --set-config=compression=true
+          ccache --set-config=compression_level=6
+          ccache --zero-stats
+
+      - name: Build v0.32 Turnip
+        run: |
+          set -o pipefail
+          chmod +x scripts/92_build_turnip_mesa_26_2_2.sh
+          mkdir -p artifacts
+          ./scripts/92_build_turnip_mesa_26_2_2.sh \
+            "$GITHUB_WORKSPACE" "$NDK_ROOT" \
+            "$GITHUB_WORKSPACE/artifacts/turnip-mesa-26.2.2" \
+            2>&1 | tee artifacts/turnip-v032-build.log
+
+      - name: Package KernelSU modules
+        run: |
+          set -Eeuo pipefail
+          chmod +x scripts/92_package_turnip_a619_module.sh scripts/92_package_turnip_a619_persistent_module.sh
+          ./scripts/92_package_turnip_a619_module.sh \
+            "$GITHUB_WORKSPACE" \
+            "$GITHUB_WORKSPACE/artifacts/turnip-mesa-26.2.2" \
+            "$GITHUB_WORKSPACE/release-turnip"
+          ./scripts/92_package_turnip_a619_persistent_module.sh \
+            "$GITHUB_WORKSPACE" \
+            "$GITHUB_WORKSPACE/artifacts/turnip-mesa-26.2.2" \
+            "$GITHUB_WORKSPACE/release-turnip-persistent"
+
+      - name: Audit v0.32 package
+        run: |
+          set -Eeuo pipefail
+          DRIVER="artifacts/turnip-mesa-26.2.2/dist/vulkan.adreno.so"
+          INFO="artifacts/turnip-mesa-26.2.2/BUILD-INFO.txt"
+          ZIP="release-turnip/touchGrass-Turnip-A619-Mesa-26.2.2-KGSL-Vulkan-1.4-KSU.zip"
+          PERSIST_ZIP="release-turnip-persistent/touchGrass-Turnip-A619-Mesa-26.2.2-KGSL-Vulkan-1.4-PERSISTENT-KSU.zip"
+          test -s "$DRIVER"
+          test -s "$INFO"
+          test -s "$ZIP"
+          test -s "$PERSIST_ZIP"
+          grep -Fxq 'mesa_version=26.2.2' "$INFO"
+          grep -Fxq 'gpu=Adreno 619' "$INFO"
+          grep -Fxq 'kmd=KGSL' "$INFO"
+          grep -Fxq 'turnip_api_cap=Vulkan-1.4' "$INFO"
+          grep -Fxq 'kgsl_sync_merge=fixed-mixed-ts-syncfd-and-cross-queue-ts' "$INFO"
+          unzip -p "$PERSIST_ZIP" module.prop | grep -Fxq 'version=0.32-vk1.4-syncmerge-fix'
+          unzip -p "$PERSIST_ZIP" module.prop | grep -Fxq 'versionCode=44'
+          file "$DRIVER" | grep -Fq 'ARM aarch64'
+          echo 'v032_release_audit=PASS'
+
+      - name: Prepare release notes
+        run: |
+          cat > RELEASE-NOTES.md <<'EOF'
+          # v0.32 — Golden Functional Baseline
+
+          Stable Mesa 26.2.2 Turnip Vulkan 1.4 build for Samsung Galaxy A52 5G (`a52xq`) / Adreno 619, packaged for KernelSU.
+
+          Highlights:
+          - Vulkan 1.4 enabled for Adreno 619 only.
+          - Legacy KGSL zero-timeout fence polling fix.
+          - Android YV12 / flexible YUV420 / NV21 compatibility fixes.
+          - Camera NV21 compatibility retained.
+          - KGSL NAP enabled (`force_no_nap=0`).
+          - KGSL idle timer set to 40 ms.
+          - Fixed Mesa KGSL mixed timestamp/sync-FD merge and cross-queue timestamp merge bugs.
+          - Warframe crash caused by the sync merge bug is fixed.
+
+          This release is the project's **golden functional baseline**. New rendering-policy experiments should branch from this version.
+
+          The persistent KernelSU ZIP is the normal system-wide test/install package. The reversible ZIP is included for controlled testing.
+          EOF
+
+      - name: Publish GitHub release v0.32
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+          ZIP="release-turnip/touchGrass-Turnip-A619-Mesa-26.2.2-KGSL-Vulkan-1.4-KSU.zip"
+          PERSIST_ZIP="release-turnip-persistent/touchGrass-Turnip-A619-Mesa-26.2.2-KGSL-Vulkan-1.4-PERSISTENT-KSU.zip"
+          INFO="artifacts/turnip-mesa-26.2.2/BUILD-INFO.txt"
+          if gh release view v0.32 >/dev/null 2>&1; then
+            gh release delete v0.32 --yes --cleanup-tag
+          fi
+          gh release create v0.32 \
+            "$PERSIST_ZIP" \
+            "$ZIP" \
+            "$INFO#BUILD-INFO-v0.32.txt" \
+            --target "$GITHUB_SHA" \
+            --title "v0.32 — Golden Functional Baseline" \
+            --notes-file RELEASE-NOTES.md
